@@ -49,7 +49,9 @@ def freeze(scenario_id: str) -> dict:
 
     metrics = Metrics(dt_hours=engine.config.dt_hours)
     controller = make_parametric_controller(ParametricControllerParams())
-    steps = len(state["profiles"]["demand"])
+    # The scenario loader stores the full demand series under the private
+    # `_profiles_full` key; controllers see only the current scalar.
+    steps = len(state["_profiles_full"]["demand"])
 
     # Sum each cost component across the do-nothing run. Persisted as
     # `baseline_breakdown` in the scenario JSON for any future tooling or

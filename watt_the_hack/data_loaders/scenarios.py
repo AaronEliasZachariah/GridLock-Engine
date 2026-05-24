@@ -57,18 +57,29 @@ def load_scenario(path: str | Path) -> tuple[dict, dict]:
     solar = profiles["solar"]
     price = profiles["price"]
 
+    # IMPORTANT: keys prefixed with `_` are ENGINE-INTERNAL. They carry the
+    # full demand/solar/price profiles, the unredacted event list, attack
+    # windows with corruption magnitudes, and the forecast noise parameters
+    # (including the persistent bias `mu_*` and the RNG `seed`). Exposing any
+    # of these to a controller leaks future intent and breaks the game.
+    #
+    # Controllers receive a filtered view via Engine.controller_view(state),
+    # which keeps only the public surface (current scalars, bounded forecast,
+    # features, agent_plan, alerts, bookkeeping).
     initial_state = {
         "time": 0,
         "demand": demand[0] if demand else 0.0,
         "solar": solar[0] if solar else 0.0,
         "soc": 0.50,
-        "profiles": {"demand": demand, "solar": solar, "price": price},
-        "price_profile": price,
         "price": float(price[0]) if price else 0.0,
         "scenario_id": spec.get("id"),
-        "events": _normalise_events(spec.get("events", [])),
-        "forecast_config": dict(spec["forecast"]) if "forecast" in spec else None,
-        "attack_windows": spec.get("attack_windows", []),
+        "alerts": [],  # populated per step by the engine; never spoilers
+        # Engine-internal — DO NOT add these to controller_view's allowlist
+        "_profiles_full": {"demand": demand, "solar": solar, "price": price},
+        "_price_profile_full": price,
+        "_events_full": _normalise_events(spec.get("events", [])),
+        "_forecast_config_full": dict(spec["forecast"]) if "forecast" in spec else None,
+        "_attack_windows_full": spec.get("attack_windows", []),
     }
     # Optional throughput budget: total |kWh| the battery may move across
     # the whole run. Absent (or null) = unlimited (engine ignores it).
@@ -285,7 +296,8 @@ def _normalise_events(raw_events: list[dict]) -> list[dict]:
     Unknown / mechanic-specific fields (e.g. ``sigma_multiplier`` on
     ``weather_anomaly`` events, ``channel`` + ``bias`` on ``forecast_bias``
     events) are passed through verbatim. The engine reads them out of
-    ``state["events"]`` when processing the corresponding mechanic. Without
+    ``state["_events_full"]`` when processing the corresponding mechanic
+    (this list is engine-private and never reaches controllers). Without
     this passthrough, scenario-authored overrides would be silently dropped.
     """
     out = []

@@ -207,8 +207,9 @@ def sim_init(req: InitRequest = InitRequest()) -> InitResponse:
 
     spec, state = load_scenario(path)
     spec_meta = public_metadata(spec)
-    # Number of steps comes from the loaded profiles, not the request
-    steps = len(state["profiles"]["demand"])
+    # Number of steps comes from the loaded profiles, not the request.
+    # Read the private series — controllers never see this length directly.
+    steps = len(state["_profiles_full"]["demand"])
 
     _engine.add_forecast_to_state(state)
 
@@ -391,77 +392,64 @@ def _is_judging_scenario_by_id(scenario_id: str) -> bool:
     return False
 
 
-def _strip_internal_state(state: dict[str, Any]) -> None:
-    """Strip internal fields that should never be sent to the client."""
-    state.pop("_ar1_cache", None)
-    state.pop("forecast_config", None)
-    state.pop("attack_windows", None)
-
-
 def _prepare_state_for_response(state: dict[str, Any]) -> None:
-    """Strip internal and scenario-hidden fields before returning state."""
-    _strip_internal_state(state)
-    
-    # ALWAYS strip the ground-truth profiles so controllers cannot cheat by reading future steps.
-    state.pop("profiles", None)
-    state.pop("price_profile", None)
-    
-    visibility = _controller_visibility(state)
-    if visibility.get("events") is False:
-        state.pop("events", None)
+    """Strip every engine-internal field before serialising to the client.
+
+    With the engine state now carrying full profiles, events, attack
+    windows, and forecast config under `_`-prefixed keys, "stripping"
+    reduces to dropping every key starting with `_`. The `Engine.
+    controller_view` allowlist is the source of truth for what stays.
+    """
+    for key in [k for k in state.keys() if k.startswith("_")]:
+        state.pop(key, None)
 
 
 def _state_visible_to_controller(state: dict[str, Any]) -> dict[str, Any]:
     """Return exactly what participant code should see this step."""
-    visible = dict(state)
-    _prepare_state_for_response(visible)
-    return visible
+    return Engine.controller_view(state)
+
+
+# Keys that the scenario loader injects into initial_state. The browser
+# round-trips state through HTTP, which strips every `_`-prefixed key, so
+# we re-merge them from disk before handing the state to the engine.
+_REHYDRATE_KEYS: tuple[str, ...] = (
+    "_profiles_full",
+    "_price_profile_full",
+    "_events_full",
+    "_forecast_config_full",
+    "_attack_windows_full",
+    "features",
+)
 
 
 def _rehydrate_state_for_engine(state: dict[str, Any]) -> dict[str, Any]:
-    """Restore scenario internals stripped from controller-visible state."""
+    """Restore engine-internal scenario fields after they round-trip
+    through HTTP (which strips them so they never reach controllers).
+    """
     scenario_id = state.get("scenario_id")
     if not scenario_id:
         return state
-
     path = find_scenario_by_id(str(scenario_id))
     if path is None:
         return state
-
     _, scenario_state = load_scenario(path)
     engine_state = dict(state)
-    for key in (
-        "profiles",
-        "price_profile",
-        "events",
-        "forecast_config",
-        "attack_windows",
-        "features",
-    ):
+    for key in _REHYDRATE_KEYS:
         if key in scenario_state:
             engine_state[key] = scenario_state[key]
     return engine_state
 
 
-def _controller_visibility(state: dict[str, Any]) -> dict[str, Any]:
-    scenario_id = state.get("scenario_id")
-    if not scenario_id:
-        return {}
-
-    path = find_scenario_by_id(str(scenario_id))
-    if path is None:
-        return {}
-
-    spec, _ = load_scenario(path)
-    return dict(spec.get("controller_visibility", {}) or {})
-
-
 def _strip_judging_data(
     state: dict[str, Any], outputs: dict[str, Any] | None = None
 ) -> None:
-    """Strip scenario data from judging scenarios to prevent probing."""
-    state.pop("profiles", None)
-    state.pop("price_profile", None)
+    """Strip scenario data from judging scenarios to prevent probing.
+
+    Belt-and-braces on top of `_prepare_state_for_response`: removes the
+    bounded forecast (still ground truth from the judge's POV) and the
+    realised tariff so a judging client can't reverse-engineer the price
+    profile by replaying with synthetic actions.
+    """
     state.pop("forecast", None)
     if outputs is not None:
         outputs.pop("import_price", None)

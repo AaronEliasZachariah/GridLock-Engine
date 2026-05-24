@@ -30,7 +30,10 @@ def run_simulation(
     outputs_history = []
 
     for _ in range(steps):
-        action = controller(state)
+        # Controllers ONLY see the public state surface. Engine.step
+        # continues to read from the full state dict for forecast bias,
+        # cyber-attack windows, and profile lookups.
+        action = controller(engine.controller_view(state))
         state, outputs = engine.step(state, action)
         metrics.update(state, outputs)
         states.append(dict(state))

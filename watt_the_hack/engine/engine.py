@@ -88,6 +88,32 @@ class SimulationConfig:
     # comparable to good arbitrage. Neither strategy dominates the other.
     fcas_revenue_per_kw_per_hour: float = 0.04
 
+    # ---------------- Compliance mechanic (S5+) ----------------
+    # Operators occasionally issue directives that constrain dispatch
+    # (e.g. AEMO Reserve Trader: "hold ≥30% SOC reserve until 22:00").
+    # Real-world: these directives arrive as prose to a human operator,
+    # who interprets them into operational limits. In the simulator,
+    # qualitative_alert events carry the prose; the controller's
+    # agent_plan (typically populated by an LLM strategy layer) carries
+    # the extracted numerical constraints. The engine reads the latter.
+    #
+    # Three constraint keys are recognised under state["agent_plan"]:
+    #   compliance_window: [start_step, end_step] — when the constraints
+    #     are active. If absent, the other keys are ignored (no
+    #     compliance enforcement that step).
+    #   min_soc_floor: float in [0,1] — penalise per-step SOC shortfall
+    #     below this level.
+    #   max_export_kw_override: float — penalise net exports above this
+    #     ceiling (i.e. abs(net_grid_power) above this when exporting).
+    #
+    # Penalties are MODERATE — well above battery wear (~$0.05/kWh) so
+    # ignoring them is costly, but well below blackouts ($10/kWh) so a
+    # controller can prefer compliance breach to load shedding in a
+    # genuine emergency. This is the design: compliance is a soft
+    # operational constraint, not a hard physics one.
+    compliance_soc_penalty_per_unit: float = 4.00  # $/SOC-unit short, per step
+    compliance_export_penalty_per_kw: float = 2.00  # $/kW exceeded, per step
+
     # Forecast configuration (lookahead with growing noise)
     forecast_horizon: int = 16  # how many future steps the controller sees
     forecast_sigma_demand: float = 3.0  # additive noise std (kW)
@@ -102,11 +128,107 @@ class SimulationConfig:
     forecast_seed: int | None = None  # set for reproducible noise; None = random
 
 
+# Controller-visible state surface. Engine.controller_view filters every
+# state dict down to these keys before it reaches participant code.
+#
+# Anything outside this set is engine bookkeeping or scenario ground truth.
+# Adding a key here is a deliberate decision to expose new information to
+# controllers; never widen this set without thinking through the cheat path
+# (e.g. exposing a full profile lets a controller perfectly forecast the run).
+#
+# Companion private keys carry the same data for engine internals:
+#   _profiles_full         — full demand/solar series
+#   _price_profile_full    — full price series
+#   _events_full           — every scenario event with all fields
+#   _attack_windows_full   — every cyber attack window with corruption_scale
+#   _forecast_config_full  — sigma/mu/seed/horizon (mu and seed are spoilers)
+#   _ar1_cache             — forecast RNG state for fast-forwarding
+_CONTROLLER_PUBLIC_KEYS: frozenset[str] = frozenset(
+    {
+        # Clock
+        "time",
+        # Current realised values
+        "demand",
+        "solar",
+        "price",
+        "soc",
+        # Bounded forecast (already horizon-limited by _build_forecast)
+        "forecast",
+        # Rules of the game
+        "features",
+        "scenario_id",
+        "grid_co2_intensity",
+        # Bookkeeping the controller earned and may want to read
+        "peak_import_kw",
+        "prev_grid_power_kw",
+        "battery_throughput_remaining_kwh",
+        "battery_throughput_budget_kwh",
+        # Channels for agentic strategies
+        "agent_plan",
+        # Currently-firing qualitative alerts (redacted; no bias/sigma payload)
+        "alerts",
+    }
+)
+
+
 @dataclass(slots=True)
 class Engine(SimulationEngine):
     """Single node MVP engine with local storage, solar, emergency generation, and curtailment."""
 
     config: SimulationConfig = field(default_factory=SimulationConfig)
+
+    @staticmethod
+    def controller_view(state: dict) -> dict:
+        """Return the subset of ``state`` safe to expose to controllers.
+
+        Drops full demand/solar/price profiles, the unredacted event list,
+        attack windows, forecast noise parameters, AR(1) cache, and any
+        other engine-internal bookkeeping that would leak future intent.
+
+        Use this at every controller boundary (admin runtime, browser
+        sandbox, headless runner). Engine.step continues to read from the
+        full state dict — never pass a controller_view back to step().
+        """
+        return {k: v for k, v in state.items() if k in _CONTROLLER_PUBLIC_KEYS}
+
+    # ------------------------------------------------------------------
+    # State accessors — prefer the private `_*_full` keys (set by the
+    # scenario loader) but fall back to public legacy keys so ad-hoc
+    # tests and notebooks that hand-build a state dict still work.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _full_profile_series(state: dict, key: str) -> list[float] | None:
+        profiles = state.get("_profiles_full") or state.get("profiles") or {}
+        series = profiles.get(key)
+        return list(series) if series is not None else None
+
+    @staticmethod
+    def _full_price_profile(state: dict) -> list[float] | None:
+        series = state.get("_price_profile_full")
+        if series is None:
+            series = state.get("price_profile")
+        return list(series) if series is not None else None
+
+    @staticmethod
+    def _full_events(state: dict) -> list[dict]:
+        events = state.get("_events_full")
+        if events is None:
+            events = state.get("events")
+        return list(events or [])
+
+    @staticmethod
+    def _full_attack_windows(state: dict) -> list[dict]:
+        windows = state.get("_attack_windows_full")
+        if windows is None:
+            windows = state.get("attack_windows")
+        return list(windows or [])
+
+    @staticmethod
+    def _full_forecast_config(state: dict) -> dict | None:
+        if "_forecast_config_full" in state:
+            return state["_forecast_config_full"]
+        return state.get("forecast_config")
 
     def step(self, state: dict, action: dict) -> tuple[dict, dict]:
         """Run one timestep.
@@ -189,12 +311,35 @@ class Engine(SimulationEngine):
 
     def _read_inputs(self, state: dict, time: int) -> tuple[float, float, float, float]:
         """Pull the four scalars the engine needs at time t."""
-        profiles = state.get("profiles", {})
-        demand_kw = self._profile_at(profiles, "demand", time, state.get("demand", 0.0))
-        solar_kw = self._profile_at(profiles, "solar", time, state.get("solar", 0.0))
+        demand_kw = self._series_at(
+            self._full_profile_series(state, "demand"),
+            time,
+            state.get("demand", 0.0),
+        )
+        solar_kw = self._series_at(
+            self._full_profile_series(state, "solar"),
+            time,
+            state.get("solar", 0.0),
+        )
         soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
-        import_price = self._state_value(state, "price", "price_profile", time, 0.0)
+        import_price = self._resolve_import_price(state, time)
         return demand_kw, solar_kw, soc, import_price
+
+    def _resolve_import_price(self, state: dict, time: int) -> float:
+        """Look up the price for ``time``, preferring the full price profile.
+
+        Mirrors the old ``_state_value`` semantics: raise on out-of-range
+        when a profile is present (programming error), fall back to the
+        scalar otherwise.
+        """
+        profile = self._full_price_profile(state)
+        if profile is None:
+            return float(state.get("price", 0.0))
+        if time >= len(profile):
+            raise IndexError(
+                f"price profile does not contain timestep {time}"
+            )
+        return float(profile[time])
 
     def _compute_market(
         self,
@@ -215,6 +360,14 @@ class Engine(SimulationEngine):
         # Sentinel: missing on first step → ramp charge is 0
         prev_grid_power = state.get("prev_grid_power_kw")
 
+        soc_after = float(physics.next_soc)
+        compliance = self._compliance_breach(
+            state.get("agent_plan"),
+            time,
+            soc_after,
+            physics.net_grid_power,
+        )
+
         return self._market_step(
             net_grid_power=physics.net_grid_power,
             import_price=import_price,
@@ -227,7 +380,50 @@ class Engine(SimulationEngine):
             prev_peak_import_kw=prev_peak,
             grid_co2_intensity=grid_co2,
             prev_grid_power_kw=prev_grid_power,
+            compliance_soc_shortfall=compliance["soc_shortfall"],
+            compliance_export_excess_kw=compliance["export_excess_kw"],
         )
+
+    def _compliance_breach(
+        self,
+        agent_plan: dict | None,
+        time: int,
+        soc_after: float,
+        net_grid_power_kw: float,
+    ) -> dict[str, float]:
+        """Return per-step compliance shortfalls implied by ``agent_plan``.
+
+        Only enforced when ``agent_plan["compliance_window"]`` brackets
+        ``time``. Absent or malformed plan = zero shortfall (no
+        double-jeopardy with a controller that simply ignores the
+        mechanic; you only pay when you opt in and then breach).
+        """
+        zero = {"soc_shortfall": 0.0, "export_excess_kw": 0.0}
+        if not isinstance(agent_plan, dict):
+            return zero
+        window = agent_plan.get("compliance_window")
+        if not (
+            isinstance(window, (list, tuple))
+            and len(window) == 2
+            and int(window[0]) <= time <= int(window[1])
+        ):
+            return zero
+
+        soc_shortfall = 0.0
+        floor = agent_plan.get("min_soc_floor")
+        if isinstance(floor, (int, float)):
+            soc_shortfall = max(0.0, float(floor) - soc_after)
+
+        export_excess = 0.0
+        export_cap = agent_plan.get("max_export_kw_override")
+        if isinstance(export_cap, (int, float)) and net_grid_power_kw < 0:
+            exported_kw = -net_grid_power_kw
+            export_excess = max(0.0, exported_kw - float(export_cap))
+
+        return {
+            "soc_shortfall": soc_shortfall,
+            "export_excess_kw": export_excess,
+        }
 
     def _build_outputs(
         self,
@@ -282,15 +478,20 @@ class Engine(SimulationEngine):
                 float(budget) - abs(physics.battery_kw) * self.config.dt_hours,
             )
 
-        # Mirror profiles → top-level scalars for controllers to read
-        profiles = state.get("profiles", {})
-        if "demand" in profiles and next_time < len(profiles["demand"]):
-            new_state["demand"] = float(profiles["demand"][next_time])
-        if "solar" in profiles and next_time < len(profiles["solar"]):
-            new_state["solar"] = float(profiles["solar"][next_time])
+        # Mirror profiles → top-level scalars for controllers to read.
+        # Read from the private full series; the public `profiles` key is
+        # no longer present in scenario-loaded states.
+        demand_series = self._full_profile_series(state, "demand")
+        if demand_series is not None and next_time < len(demand_series):
+            new_state["demand"] = float(demand_series[next_time])
 
-        # Keep state["price"] == price_profile[t+1] for the controller view.
-        # _state_value() still prefers the profile row directly when present.
+        solar_series = self._full_profile_series(state, "solar")
+        if solar_series is not None and next_time < len(solar_series):
+            new_state["solar"] = float(solar_series[next_time])
+
+        # Keep state["price"] aligned with price_profile[t+1] for the
+        # controller view. The engine itself still reads from the full
+        # profile directly inside _read_inputs.
         new_state["price"] = self._price_at_timestep(new_state, next_time, import_price)
 
         # Refresh the forecast only for scenarios that opted into forecasts.
@@ -299,18 +500,46 @@ class Engine(SimulationEngine):
         else:
             new_state.pop("forecast", None)
 
+        # Refresh currently-firing qualitative alerts. This is the ONLY
+        # channel through which controllers see event content — the full
+        # event list lives in `_events_full` and is engine-only.
+        new_state["alerts"] = self._current_alerts(state, next_time)
+
         return new_state
 
-    @staticmethod
-    def _profile_at(profiles: dict, key: str, time: int, fallback: float) -> float:
-        """Look up profiles[key][time] with a scalar fallback."""
-        series = profiles.get(key)
-        if series is not None and time < len(series):
-            return float(series[time])
-        return float(fallback)
+    def _current_alerts(self, state: dict, time: int) -> list[dict]:
+        """Return qualitative_alert events active at ``time``, redacted.
+
+        Strips every field except the narrative ones a controller should
+        see (`id`, `severity`, `at_step`, `end_step`, `title`,
+        `description`, `icon`). Crucially this drops any `bias`,
+        `channel`, `sigma_multiplier`, or other forecast-perturbation
+        payload that would let a reader reverse-engineer the engine's
+        next move.
+        """
+        visible_fields = (
+            "id",
+            "severity",
+            "at_step",
+            "end_step",
+            "title",
+            "description",
+            "icon",
+        )
+        out: list[dict] = []
+        for ev in self._full_events(state):
+            if ev.get("type") != "qualitative_alert":
+                continue
+            at_step = int(ev.get("at_step", -1))
+            end_step = int(ev.get("end_step", at_step))
+            if at_step <= time <= end_step:
+                out.append({k: ev.get(k) for k in visible_fields if k in ev})
+        return out
 
     def add_forecast_to_state(self, state: dict) -> dict:
-        """Inject state["forecast"] for the current timestep. Call once at init."""
+        """Inject state["forecast"] and state["alerts"] for the current
+        timestep. Call once at init, before the first engine.step().
+        """
         time = int(state.get("time", 0))
         state["price"] = self._price_at_timestep(
             state, time, float(state.get("price", 0.2))
@@ -319,16 +548,24 @@ class Engine(SimulationEngine):
             state["forecast"] = self._build_forecast(state, time)
         else:
             state.pop("forecast", None)
+        # Surface any qualitative alerts firing at t=0 so the controller's
+        # plan()/first step() call can react to them.
+        state["alerts"] = self._current_alerts(state, time)
         return state
 
-    @staticmethod
-    def _forecast_enabled(state: dict) -> bool:
+    @classmethod
+    def _forecast_enabled(cls, state: dict) -> bool:
         """Scenario-loaded states set forecast_config=None to disable forecasts.
 
         Missing forecast_config remains enabled for backwards-compatible tests
         and ad-hoc engine use.
         """
-        return state.get("forecast_config", {}) is not None
+        # Sentinel-aware: a key present and set to None means "explicitly off".
+        if "_forecast_config_full" in state:
+            return state["_forecast_config_full"] is not None
+        if "forecast_config" in state:
+            return state["forecast_config"] is not None
+        return True
 
     def _build_forecast(self, state: dict, time: int) -> dict:
         """Return a noisy view of the next H steps of demand, solar, and price.
@@ -346,18 +583,20 @@ class Engine(SimulationEngine):
             scenario_id = state.get("scenario_id", "default")
             seed = hash(scenario_id) % 1_000_000
 
-        profiles = state.get("profiles", {}) or {}
         sources = {
-            "demand": profiles.get("demand"),
-            "solar": profiles.get("solar"),
-            "price": state.get("price_profile"),
+            "demand": self._full_profile_series(state, "demand"),
+            "solar": self._full_profile_series(state, "solar"),
+            "price": self._full_price_profile(state),
         }
 
         forecast: dict[str, list[float]] = {}
-        forecast_config = state.get("forecast_config", {})
+        forecast_config = self._full_forecast_config(state)
         if forecast_config is None:
             return forecast
-        events = state.get("events", [])
+        if not isinstance(forecast_config, dict):
+            forecast_config = {}
+        events = self._full_events(state)
+        attack_windows = self._full_attack_windows(state)
 
         horizon = forecast_config.get("horizon_steps", self.config.forecast_horizon)
         rho = forecast_config.get("ar1_rho", self.config.forecast_ar1_rho)
@@ -454,7 +693,6 @@ class Engine(SimulationEngine):
                     val = max(0.0, val)
 
                 # Forecast corruption during attack windows (cybersecurity scenario)
-                attack_windows = state.get("attack_windows", [])
                 for window in attack_windows:
                     if window["start_step"] <= t_future <= window["end_step"]:
                         scale = window["corruption_scale"]
@@ -608,6 +846,8 @@ class Engine(SimulationEngine):
         new_peak_import_kw: float,
         grid_co2_intensity: float,
         prev_grid_power_kw: float | None,
+        compliance_soc_shortfall: float = 0.0,
+        compliance_export_excess_kw: float = 0.0,
     ) -> dict:
         """Calculate every cost component for this timestep.
 
@@ -672,6 +912,14 @@ class Engine(SimulationEngine):
             "ramp_charge": ramp_charge,
             # FCAS revenue: NEGATIVE cost (income) for capacity held available.
             "fcas_revenue": -fcas_reserve_kw * dt * cfg.fcas_revenue_per_kw_per_hour,
+            # Compliance: zero by default; only positive when the controller
+            # opted in via agent_plan AND breached the bound it set.
+            "compliance_penalty": (
+                compliance_soc_shortfall * cfg.compliance_soc_penalty_per_unit
+                + compliance_export_excess_kw
+                * dt
+                * cfg.compliance_export_penalty_per_kw
+            ),
         }
 
         return {
@@ -726,46 +974,26 @@ class Engine(SimulationEngine):
 
         return self._clip(next_soc, 0.0, 1.0)
 
-    @staticmethod
+    @classmethod
     def _price_at_timestep(
-        state: dict[str, Any], timestep: int, fallback: float
+        cls, state: dict[str, Any], timestep: int, fallback: float
     ) -> float:
-        """Expose the same tariff the engine uses so state['price'] matches price_profile[t]."""
-        profile = state.get("price_profile")
-        if isinstance(profile, list) and len(profile) > 0:
+        """Expose the same tariff the engine uses so state['price'] matches
+        the full price profile at ``timestep``. Falls back to the scalar
+        when no profile is present (legacy tests).
+        """
+        profile = cls._full_price_profile(state)
+        if profile:
             idx = max(0, min(timestep, len(profile) - 1))
             return float(profile[idx])
         return float(state.get("price", fallback))
 
     @staticmethod
-    def _state_value(
-        state: dict[str, Any],
-        scalar_key: str,
-        profile_key: str,
-        time: int,
-        default: float,
-    ) -> float:
-        """Look up a top-level profile value with a strict integrity check.
-
-        Used for the import_price lookup. Three-step resolution:
-          1. If `scalar_key` is set and there's no profile, use the scalar.
-          2. If `profile_key` is a list and `time` is in range, use it.
-          3. If `profile_key` exists but `time` is past its end, raise — this
-             is a programming error (state advanced past the profile horizon).
-          4. Otherwise fall back to the scalar / default.
-
-        Differs from `_profile_at`: this one raises on out-of-range, while
-        `_profile_at` silently falls back. Use this when you want bugs to
-        surface; use `_profile_at` when graceful degradation is fine.
-        """
-        if scalar_key in state and profile_key not in state:
-            return float(state[scalar_key])
-        profile = state.get(profile_key)
-        if profile is None:
-            return float(state.get(scalar_key, default))
-        if time >= len(profile):
-            raise IndexError(f"{profile_key} does not contain timestep {time}")
-        return float(profile[time])
+    def _series_at(series: list[float] | None, time: int, fallback: float) -> float:
+        """Look up ``series[time]`` with a scalar fallback when missing."""
+        if series is not None and time < len(series):
+            return float(series[time])
+        return float(fallback)
 
     @staticmethod
     def _clip(value: float, lower: float, upper: float) -> float:

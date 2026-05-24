@@ -113,26 +113,27 @@ def main():
         if isinstance(plan_result, dict):
             initial_state.update(plan_result)
             
-    # 2b. We create a wrapper to handle the replan hook mid-simulation, 
-    # just like the cloud eval_worker does.
+    # 2b. We create a wrapper to handle the replan hook mid-simulation,
+    # just like the cloud eval_worker does. The runner passes us the
+    # controller view, which contains a redacted state["alerts"] list
+    # of qualitative alerts firing this step — no need to filter the raw
+    # event list (which is engine-private and not visible here).
     def controller_wrapper(state):
-        current_t = int(state.get("time", 0))
-        alerts = [
-            e for e in state.get("events", [])
-            if e.get("type") == "qualitative_alert" and int(e.get("at_step", -1)) == current_t
-        ]
+        alerts = state.get("alerts", [])
         if alerts and hasattr(strategy, "replan"):
             update = strategy.replan(state, alerts)
             if isinstance(update, dict):
                 state["agent_plan"] = {**state.get("agent_plan", {}), **update.get("agent_plan", {})}
-                
+
         return strategy.step(state)
-        
-    # 2c. Run the simulation
+
+    # 2c. Run the simulation. Read the run length from the private
+    # `_profiles_full` key — only the test harness sees this; controllers
+    # receive Engine.controller_view(state) and never see the full series.
     result = run_simulation(
-        controller=controller_wrapper, 
+        controller=controller_wrapper,
         initial_state=initial_state,
-        steps=len(initial_state.get("profiles", {}).get("demand", []))
+        steps=len(initial_state.get("_profiles_full", {}).get("demand", []))
     )
     
     print("\n✅ Simulation Complete!")
