@@ -90,29 +90,26 @@ class SimulationConfig:
 
     # ---------------- Compliance mechanic (S5+) ----------------
     # Operators occasionally issue directives that constrain dispatch
-    # (e.g. AEMO Reserve Trader: "hold ≥30% SOC reserve until 22:00").
-    # Real-world: these directives arrive as prose to a human operator,
-    # who interprets them into operational limits. In the simulator,
-    # qualitative_alert events carry the prose; the controller's
-    # agent_plan (typically populated by an LLM strategy layer) carries
-    # the extracted numerical constraints. The engine reads the latter.
+    # (e.g. AEMO Reserve Trader: "hold ≥30% SOC reserve until 22:00",
+    # "no exports above 20 kW during transformer maintenance").
     #
-    # Three constraint keys are recognised under state["agent_plan"]:
-    #   compliance_window: [start_step, end_step] — when the constraints
-    #     are active. If absent, the other keys are ignored (no
-    #     compliance enforcement that step).
-    #   min_soc_floor: float in [0,1] — penalise per-step SOC shortfall
-    #     below this level.
-    #   max_export_kw_override: float — penalise net exports above this
-    #     ceiling (i.e. abs(net_grid_power) above this when exporting).
+    # Real-world: these directives arrive as prose to a human operator
+    # who interprets them into operational limits. In the simulator the
+    # directives are SCENARIO-DECLARED via ``compliance_window`` events
+    # (with structured ``min_soc_floor`` / ``max_export_kw_override``
+    # fields read by the engine, not by the controller) and the engine
+    # enforces them automatically when their step window is active.
     #
-    # Penalties are MODERATE — well above battery wear (~$0.05/kWh) so
-    # ignoring them is costly, but well below blackouts ($10/kWh) so a
-    # controller can prefer compliance breach to load shedding in a
-    # genuine emergency. This is the design: compliance is a soft
-    # operational constraint, not a hard physics one.
-    compliance_soc_penalty_per_unit: float = 4.00  # $/SOC-unit short, per step
-    compliance_export_penalty_per_kw: float = 2.00  # $/kW exceeded, per step
+    # The LLM moat is the LEAD TIME from reading the announcing
+    # ``qualitative_alert`` (which fires earlier and surfaces in
+    # ``state["alerts"]``) and positioning SOC / capping exports before
+    # the compliance window opens.
+    #
+    # Penalties are MODERATE — well above battery wear so ignoring the
+    # directive is costly, well below blackouts so a controller never
+    # rationally sheds load to comply.
+    compliance_soc_penalty_per_unit: float = 10.00  # $/SOC-unit short, per step
+    compliance_export_penalty_per_kw: float = 5.00  # $/kW exceeded, per step
 
     # Forecast configuration (lookahead with growing noise)
     forecast_horizon: int = 16  # how many future steps the controller sees
@@ -362,7 +359,7 @@ class Engine(SimulationEngine):
 
         soc_after = float(physics.next_soc)
         compliance = self._compliance_breach(
-            state.get("agent_plan"),
+            self._full_events(state),
             time,
             soc_after,
             physics.net_grid_power,
@@ -384,41 +381,37 @@ class Engine(SimulationEngine):
             compliance_export_excess_kw=compliance["export_excess_kw"],
         )
 
+    @staticmethod
     def _compliance_breach(
-        self,
-        agent_plan: dict | None,
+        events: list[dict],
         time: int,
         soc_after: float,
         net_grid_power_kw: float,
     ) -> dict[str, float]:
-        """Return per-step compliance shortfalls implied by ``agent_plan``.
+        """Return per-step compliance shortfalls implied by any active
+        ``compliance_window`` events.
 
-        Only enforced when ``agent_plan["compliance_window"]`` brackets
-        ``time``. Absent or malformed plan = zero shortfall (no
-        double-jeopardy with a controller that simply ignores the
-        mechanic; you only pay when you opt in and then breach).
+        Engine-enforced (not opt-in). A controller that ignored the
+        announcing qualitative_alert eats the penalty without warning.
+        Values are summed across overlapping windows.
         """
-        zero = {"soc_shortfall": 0.0, "export_excess_kw": 0.0}
-        if not isinstance(agent_plan, dict):
-            return zero
-        window = agent_plan.get("compliance_window")
-        if not (
-            isinstance(window, (list, tuple))
-            and len(window) == 2
-            and int(window[0]) <= time <= int(window[1])
-        ):
-            return zero
-
         soc_shortfall = 0.0
-        floor = agent_plan.get("min_soc_floor")
-        if isinstance(floor, (int, float)):
-            soc_shortfall = max(0.0, float(floor) - soc_after)
-
         export_excess = 0.0
-        export_cap = agent_plan.get("max_export_kw_override")
-        if isinstance(export_cap, (int, float)) and net_grid_power_kw < 0:
-            exported_kw = -net_grid_power_kw
-            export_excess = max(0.0, exported_kw - float(export_cap))
+        export_kw = max(0.0, -net_grid_power_kw)
+
+        for ev in events:
+            if ev.get("type") != "compliance_window":
+                continue
+            at_step = int(ev.get("at_step", -1))
+            end_step = int(ev.get("end_step", at_step))
+            if not (at_step <= time <= end_step):
+                continue
+            floor = ev.get("min_soc_floor")
+            if isinstance(floor, (int, float)):
+                soc_shortfall += max(0.0, float(floor) - soc_after)
+            cap = ev.get("max_export_kw_override")
+            if isinstance(cap, (int, float)) and export_kw > 0:
+                export_excess += max(0.0, export_kw - float(cap))
 
         return {
             "soc_shortfall": soc_shortfall,
@@ -507,18 +500,46 @@ class Engine(SimulationEngine):
 
         return new_state
 
-    def _current_alerts(self, state: dict, time: int) -> list[dict]:
-        """Return qualitative_alert events active at ``time``, redacted.
+    # Event types whose prose is exposed to the controller via state["alerts"].
+    # The set excludes engine-internal enforcement types (e.g.
+    # ``compliance_window``) that exist solely to drive penalties —
+    # leaking those would let a controller read the structured constraint
+    # values that the LLM is supposed to extract from the prose.
+    _CONTROLLER_VISIBLE_EVENT_TYPES: frozenset[str] = frozenset(
+        {
+            "qualitative_alert",
+            "forecast_bias",
+            "forecast_error",
+            "weather_anomaly",
+            "demand_spike",
+            "weather",
+            "price_signal",
+            "signal",
+            "info",
+            "demand",
+            "price_peak",
+            "other",
+        }
+    )
 
-        Strips every field except the narrative ones a controller should
-        see (`id`, `severity`, `at_step`, `end_step`, `title`,
-        `description`, `icon`). Crucially this drops any `bias`,
-        `channel`, `sigma_multiplier`, or other forecast-perturbation
-        payload that would let a reader reverse-engineer the engine's
-        next move.
+    def _current_alerts(self, state: dict, time: int) -> list[dict]:
+        """Return events ACTIVE at ``time``, redacted to narrative fields.
+
+        Includes every scenario event type whose prose is fair game for
+        controllers (qualitative alerts, forecast_bias announcements,
+        weather notes, etc.). Excludes engine-internal types like
+        ``compliance_window`` — those carry structured constraint values
+        the engine alone reads.
+
+        Strips every per-event spoiler field on the way out: ``bias``,
+        ``channel``, ``sigma_multiplier``, ``corruption_scale``,
+        ``min_soc_floor``, ``max_export_kw_override``. Only narrative
+        metadata (id, type, severity, timing, title, description, icon)
+        survives the strip.
         """
         visible_fields = (
             "id",
+            "type",
             "severity",
             "at_step",
             "end_step",
@@ -528,7 +549,8 @@ class Engine(SimulationEngine):
         )
         out: list[dict] = []
         for ev in self._full_events(state):
-            if ev.get("type") != "qualitative_alert":
+            ev_type = ev.get("type", "")
+            if ev_type not in self._CONTROLLER_VISIBLE_EVENT_TYPES:
                 continue
             at_step = int(ev.get("at_step", -1))
             end_step = int(ev.get("end_step", at_step))
@@ -912,8 +934,10 @@ class Engine(SimulationEngine):
             "ramp_charge": ramp_charge,
             # FCAS revenue: NEGATIVE cost (income) for capacity held available.
             "fcas_revenue": -fcas_reserve_kw * dt * cfg.fcas_revenue_per_kw_per_hour,
-            # Compliance: zero by default; only positive when the controller
-            # opted in via agent_plan AND breached the bound it set.
+            # Compliance: triggered by scenario-declared compliance_window
+            # events. Zero when no window is active. The LLM moat: read the
+            # announcing qualitative_alert and position SOC / cap exports
+            # before this fires.
             "compliance_penalty": (
                 compliance_soc_shortfall * cfg.compliance_soc_penalty_per_unit
                 + compliance_export_excess_kw
