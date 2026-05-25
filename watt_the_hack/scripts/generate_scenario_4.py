@@ -53,14 +53,21 @@ def build_scenario(scenario_id, title, is_judging=False):
     else:
         # Judging: Randomised but 4 incidents (3 true, 1 false)
         attacks = [
-            {"start": random.randint(20, 60), "end_offset": 12, "scale": 0.18, "is_true": True, "title": "IDS Alert - Perimeter", "desc": "Unexpected API calls bypassing auth token validation. Potential data spoofing in progress."},
+            {"start": random.randint(20, 60), "end_offset": 12, "scale": 0.8, "is_true": True, "title": "IDS Alert - Perimeter", "desc": "Unexpected API calls bypassing auth token validation. Potential data spoofing in progress."},
             {"start": random.randint(100, 150), "end_offset": 10, "scale": 0.0, "is_true": False, "title": "IDS Alert - Sensor Sync", "desc": "Clock drift detected on forecasting sensors. NTP service restarted automatically."},
-            {"start": random.randint(180, 210), "end_offset": 14, "scale": 0.22, "is_true": True, "title": "IDS Alert - Root Node", "desc": "Root access compromised. Intruders injecting adversarial noise into the predictive models."},
-            {"start": random.randint(240, 270), "end_offset": 12, "scale": 0.25, "is_true": True, "title": "IDS Alert - Gateway", "desc": "Severe packet manipulation. Values in the forecast stream fail integrity checksums."}
+            {"start": random.randint(180, 210), "end_offset": 14, "scale": 0.9, "is_true": True, "title": "IDS Alert - Root Node", "desc": "Root access compromised. Intruders injecting adversarial noise into the predictive models."},
+            {"start": random.randint(240, 270), "end_offset": 12, "scale": 0.9, "is_true": True, "title": "IDS Alert - Gateway", "desc": "Severe packet manipulation. Values in the forecast stream fail integrity checksums."}
         ]
         for a in attacks:
             if "end" not in a:
                 a["end"] = a["start"] + a["end_offset"]
+            
+            # Spike the TRUE demand during true attacks to >120kW (grid limit)
+            # This creates a massive penalty trap.
+            if a["is_true"]:
+                for t in range(a["start"], a["end"] + 1):
+                    if t < len(demand):
+                        demand[t] = 160.0
     
     for idx, atk in enumerate(attacks):
         if atk["is_true"]:
@@ -80,12 +87,43 @@ def build_scenario(scenario_id, title, is_judging=False):
             "description": atk["desc"],
             "icon": "shield-alert"
         })
+        if atk["is_true"]:
+            # Add the deadly FDI trap! Tell the controller its battery is empty,
+            # and solar is extremely high. This tricks naive controllers (like Tier 1)
+            # into CHARGING their battery during a blackout!
+            events.append({
+                "id": f"fdi_soc_{idx+1}",
+                "type": "sensor_fdi",
+                "channel": "soc",
+                "bias": -0.9, # Pretend SOC is 0%
+                "noise_sigma": 0.01,
+                "at_step": atk["start"],
+                "end_step": atk["end"]
+            })
+            # Pretend demand is zero
+            events.append({
+                "id": f"fdi_demand_{idx+1}",
+                "type": "sensor_fdi",
+                "channel": "demand",
+                "scale": 0.0,
+                "at_step": atk["start"],
+                "end_step": atk["end"]
+            })
+            # Pretend solar is huge
+            events.append({
+                "id": f"fdi_solar_{idx+1}",
+                "type": "sensor_fdi",
+                "channel": "solar",
+                "bias": 150.0,
+                "at_step": atk["start"],
+                "end_step": atk["end"]
+            })
         
     scenario = {
         "id": scenario_id,
         "title": title,
         "archetype": "cybersecurity_agentic",
-        "pool": "synthetic",
+        "pool": "judging" if is_judging else "synthetic",
         "data_source": "synthetic",
         "synthetic": {
             "mode": "inline",
@@ -105,7 +143,8 @@ def build_scenario(scenario_id, title, is_judging=False):
             "battery": True,
             "curtailment": True,
             "emergency_generator": True,
-            "fcas": True
+            "fcas": True,
+            "ids": True
         },
         "attack_windows": attack_windows,
         "ids_cost_per_step": 0.1,
@@ -131,7 +170,8 @@ def build_scenario(scenario_id, title, is_judging=False):
         }
     }
     
-    out_path = os.path.join(os.path.dirname(__file__), "..", "..", "scenarios", "synthetic", f"{scenario_id}.json")
+    folder = "judging" if is_judging else "synthetic"
+    out_path = os.path.join(os.path.dirname(__file__), "..", "..", "scenarios", folder, f"{scenario_id}.json")
     with open(out_path, "w") as f:
         json.dump(scenario, f, indent=2)
     print(f"Generated {out_path}")

@@ -295,6 +295,7 @@ class TestMarketStep:
             "ramp_charge",
             "fcas_revenue",
             "compliance_penalty",
+            "ids_cost",
             "total",
         }
         # total must equal the sum of the other components

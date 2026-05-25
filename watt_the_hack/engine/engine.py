@@ -167,6 +167,8 @@ _CONTROLLER_PUBLIC_KEYS: frozenset[str] = frozenset(
         "agent_plan",
         # Currently-firing qualitative alerts (redacted; no bias/sigma payload)
         "alerts",
+        # Numerical probability signal indicating attack likelihood if subscribed
+        "ids_signal",
     }
 )
 
@@ -262,13 +264,15 @@ class Engine(SimulationEngine):
         )
 
         # 4. Market
-        cost_breakdown = self._compute_market(state, time, import_price, physics)
+        cost_breakdown = self._compute_market(
+            state, time, import_price, physics, action
+        )
 
         # 5. Outputs
         outputs = self._build_outputs(physics, import_price, cost_breakdown)
 
         # 6. State for t+1
-        new_state = self._advance_state(state, time, physics, import_price)
+        new_state = self._advance_state(state, time, physics, import_price, action)
 
         return new_state, outputs
 
@@ -300,6 +304,11 @@ class Engine(SimulationEngine):
         if not features.get("fcas", True):
             gated["fcas_reserve_kw"] = 0.0
 
+        if not features.get("ids", True):
+            gated["subscribe_ids"] = (
+                False  # Control disable/enable of IDS (Intrusion Detection System) subscription in cybersecurity scenario
+            )
+
         # Future features (flexible_loads, forecast_purchasing) will be
         # gated here once their engine logic is implemented.
 
@@ -314,14 +323,14 @@ class Engine(SimulationEngine):
         demand_kw = self._series_at(
             self._full_profile_series(state, "demand"),
             time,
-            state.get("demand", 0.0),
+            state.get("_demand_true", state.get("demand", 0.0)),
         )
         solar_kw = self._series_at(
             self._full_profile_series(state, "solar"),
             time,
-            state.get("solar", 0.0),
+            state.get("_solar_true", state.get("solar", 0.0)),
         )
-        soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
+        soc = self._clip(float(state.get("_soc_true", state.get("soc", 0.0))), 0.0, 1.0)
         import_price = self._resolve_import_price(state, time)
         return demand_kw, solar_kw, soc, import_price
 
@@ -347,6 +356,7 @@ class Engine(SimulationEngine):
         time: int,
         import_price: float,
         physics: PhysicsResult,
+        action: dict,
     ) -> dict:
         """Resolve per-scenario market params and run the cost calculation."""
         prev_peak = float(state.get("peak_import_kw", 0.0))
@@ -367,6 +377,8 @@ class Engine(SimulationEngine):
             soc_after,
             physics.net_grid_power,
         )
+        subscribe_ids = bool(action.get("subscribe_ids", False))
+        ids_cost_per_step = float(state.get("ids_cost_per_step", 0.0))
 
         return self._market_step(
             net_grid_power=physics.net_grid_power,
@@ -382,6 +394,8 @@ class Engine(SimulationEngine):
             prev_grid_power_kw=prev_grid_power,
             compliance_soc_shortfall=compliance["soc_shortfall"],
             compliance_export_excess_kw=compliance["export_excess_kw"],
+            subscribe_ids=subscribe_ids,
+            ids_cost_per_step=ids_cost_per_step,
         )
 
     @staticmethod
@@ -463,6 +477,7 @@ class Engine(SimulationEngine):
         time: int,
         physics: PhysicsResult,
         import_price: float,
+        action: dict,
     ) -> dict:
         """Return a NEW state dict for t+1. Carries forward bookkeeping
         (peak import, prev grid power) and aligns the scalar mirrors
@@ -471,7 +486,8 @@ class Engine(SimulationEngine):
         next_time = time + 1
         new_state = dict(state)
         new_state["time"] = next_time
-        new_state["soc"] = float(physics.next_soc)
+        new_state["_soc_true"] = float(physics.next_soc)
+        new_state["soc"] = self._corrupt_sensor(new_state, "soc", float(physics.next_soc), next_time)
 
         # Bookkeeping for cost components that span steps
         new_state["peak_import_kw"] = max(
@@ -495,11 +511,15 @@ class Engine(SimulationEngine):
         # no longer present in scenario-loaded states.
         demand_series = self._full_profile_series(state, "demand")
         if demand_series is not None and next_time < len(demand_series):
-            new_state["demand"] = float(demand_series[next_time])
+            true_demand = float(demand_series[next_time])
+            new_state["_demand_true"] = true_demand
+            new_state["demand"] = self._corrupt_sensor(new_state, "demand", true_demand, next_time)
 
         solar_series = self._full_profile_series(state, "solar")
         if solar_series is not None and next_time < len(solar_series):
-            new_state["solar"] = float(solar_series[next_time])
+            true_solar = float(solar_series[next_time])
+            new_state["_solar_true"] = true_solar
+            new_state["solar"] = self._corrupt_sensor(new_state, "solar", true_solar, next_time)
 
         # Keep state["price"] aligned with price_profile[t+1] for the
         # controller view. The engine itself still reads from the full
@@ -516,6 +536,21 @@ class Engine(SimulationEngine):
         # channel through which controllers see event content — the full
         # event list lives in `_events_full` and is engine-only.
         new_state["alerts"] = self._current_alerts(state, next_time)
+
+        # IDS signal — noisy attack probability hint if controller subscribed
+        attack_windows = self._full_attack_windows(state)
+        in_attack = any(
+            w["start_step"] <= next_time <= w["end_step"] for w in attack_windows
+        )
+        if action.get("subscribe_ids", False):
+            ids_rng = random.Random(f"{next_time}_ids_{state.get('scenario_id', '')}")
+            if in_attack:
+                raw = ids_rng.gauss(0.75, 0.15)
+            else:
+                raw = ids_rng.gauss(0.15, 0.10)
+            new_state["ids_signal"] = max(0.0, min(1.0, raw))
+        else:
+            new_state["ids_signal"] = None
 
         return new_state
 
@@ -553,6 +588,24 @@ class Engine(SimulationEngine):
         timestep. Call once at init, before the first engine.step().
         """
         time = int(state.get("time", 0))
+        
+        # Initialize true state values and apply sensor corruption for t=0
+        if "_soc_true" not in state:
+            state["_soc_true"] = float(state.get("soc", 0.0))
+        state["soc"] = self._corrupt_sensor(state, "soc", state["_soc_true"], time)
+        
+        demand_series = self._full_profile_series(state, "demand")
+        if demand_series is not None and time < len(demand_series):
+            true_demand = float(demand_series[time])
+            state["_demand_true"] = true_demand
+            state["demand"] = self._corrupt_sensor(state, "demand", true_demand, time)
+            
+        solar_series = self._full_profile_series(state, "solar")
+        if solar_series is not None and time < len(solar_series):
+            true_solar = float(solar_series[time])
+            state["_solar_true"] = true_solar
+            state["solar"] = self._corrupt_sensor(state, "solar", true_solar, time)
+
         state["price"] = self._price_at_timestep(
             state, time, float(state.get("price", 0.2))
         )
@@ -564,6 +617,34 @@ class Engine(SimulationEngine):
         # plan()/first step() call can react to them.
         state["alerts"] = self._current_alerts(state, time)
         return state
+
+    def _corrupt_sensor(self, state: dict, channel: str, val: float, time: int) -> float:
+        """Applies False Data Injection (FDI) or noise to sensor telemetry."""
+        events = self._full_events(state)
+        seed = self.config.forecast_seed
+        if seed is None:
+            seed = hash(state.get("scenario_id", "default")) % 1_000_000
+
+        corrupted_val = val
+        for ev in events:
+            if ev.get("type") == "sensor_fdi" and ev.get("channel") == channel:
+                if ev.get("at_step", 0) <= time <= ev.get("end_step", 0):
+                    bias = float(ev.get("bias", 0.0))
+                    noise_sigma = float(ev.get("noise_sigma", 0.0))
+                    
+                    if noise_sigma > 0:
+                        import random
+                        rng = random.Random(f"{seed}_fdi_{channel}_{time}")
+                        corrupted_val += rng.gauss(0.0, noise_sigma)
+                        
+                    corrupted_val += bias
+                    
+                    scale = float(ev.get("scale", 1.0))
+                    corrupted_val *= scale
+
+        if channel == "soc":
+            return self._clip(corrupted_val, 0.0, 1.0)
+        return max(0.0, corrupted_val)
 
     @classmethod
     def _forecast_enabled(cls, state: dict) -> bool:
@@ -860,6 +941,8 @@ class Engine(SimulationEngine):
         prev_grid_power_kw: float | None,
         compliance_soc_shortfall: float = 0.0,
         compliance_export_excess_kw: float = 0.0,
+        subscribe_ids: bool = False,
+        ids_cost_per_step: float = 0.0,
     ) -> dict:
         """Calculate every cost component for this timestep.
 
@@ -932,6 +1015,9 @@ class Engine(SimulationEngine):
                 * dt
                 * cfg.compliance_export_penalty_per_kw
             ),
+            # IDS cost: flat fee per step when controller subscribes to the
+            # intrusion detection signal. Only active on cybersecurity scenario.
+            "ids_cost": ids_cost_per_step if subscribe_ids else 0.0,
         }
 
         return {

@@ -34,6 +34,7 @@ class ParametricControllerParamsModel(BaseModel):
     emergency_generator: float = 0.0
     curtail_solar: float = 0.0
     fcas_reserve_kw: float = 0.0
+    subscribe_ids: bool = False
 
 
 class SimpleControllerSpec(BaseModel):
@@ -371,6 +372,7 @@ def _resolve_controller(spec: ControllerSpec):
             emergency_generator=spec.params.emergency_generator,
             curtail_solar=spec.params.curtail_solar,
             fcas_reserve_kw=spec.params.fcas_reserve_kw,
+            subscribe_ids=spec.params.subscribe_ids,
         )
         return make_parametric_controller(params), None
 

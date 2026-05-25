@@ -14,6 +14,9 @@ class ParametricControllerParams:
     emergency_generator: float = 0.0  # kW, clipped to [0, max_emergency_generator_kw]
     curtail_solar: float = 0.0  # kW of solar to disconnect this step
     fcas_reserve_kw: float = 0.0  # kW of inverter capacity held for FCAS revenue
+    subscribe_ids: bool = (
+        False  # whether to subscribe to IDS events (if enabled in cybersecurity scenario)
+    )
 
 
 def make_parametric_controller(params: ParametricControllerParams):
@@ -23,6 +26,7 @@ def make_parametric_controller(params: ParametricControllerParams):
     emergency_generator = float(params.emergency_generator)
     curtail_solar = max(0.0, float(params.curtail_solar))
     fcas_reserve_kw = max(0.0, float(params.fcas_reserve_kw))
+    subscribe_ids = bool(params.subscribe_ids)
 
     def controller(_state: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -30,6 +34,7 @@ def make_parametric_controller(params: ParametricControllerParams):
             "emergency_generator": emergency_generator,
             "curtail_solar": curtail_solar,
             "fcas_reserve_kw": fcas_reserve_kw,
+            "subscribe_ids": subscribe_ids,
         }
 
     return controller
