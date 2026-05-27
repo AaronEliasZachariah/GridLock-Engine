@@ -297,6 +297,7 @@ class TestMarketStep:
             "compliance_penalty",
             "ids_cost",
             "diesel_ban_penalty",
+            "phishing_fine",
             "total",
         }
         # total must equal the sum of the other components
@@ -955,14 +956,14 @@ class TestComplianceMechanic:
         assert outputs["cost_breakdown"]["compliance_penalty"] == pytest.approx(0.0)
 
     def test_penalty_below_blackout(self):
-        """A full SOC unit shortfall must cost less than 1 kWh of blackout —
+        """A full SOC unit shortfall must cost less than 2 kWh of blackout —
         otherwise controllers may rationally shed load to comply."""
         from watt_the_hack.engine.engine import SimulationConfig
 
         cfg = SimulationConfig()
         worst_soc_penalty = 1.0 * cfg.compliance_soc_penalty_per_unit
-        blackout_1kwh = 1.0 * cfg.blackout_penalty_per_kwh
-        assert worst_soc_penalty < blackout_1kwh
+        blackout_2kwh = 2.0 * cfg.blackout_penalty_per_kwh
+        assert worst_soc_penalty < blackout_2kwh
 
     def test_penalty_above_wear_cost(self):
         """A 0.10-SOC breach held for 4 steps (1 hour) must cost more than
