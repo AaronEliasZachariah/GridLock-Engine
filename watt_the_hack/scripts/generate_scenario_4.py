@@ -44,11 +44,47 @@ def build_scenario(scenario_id, title, is_judging=False):
     events = []
     
     if not is_judging:
-        # Sandbox: Fixed
+        # Sandbox: fixed schedule — punishes duck-curve / forecast-trust meta
         attacks = [
-            {"start": 40, "end": 50, "scale": 0.20, "is_true": True, "title": "IDS Alert - Node 7", "desc": "IDS reports unauthorized access attempt on forecasting sub-node. Payload signature matches known disruption malware."},
-            {"start": 140, "end": 150, "scale": 0.25, "is_true": True, "title": "IDS Alert - Gateway", "desc": "Anomalous traffic spike from unverified external IP. Suspected MITM attack on grid telemetry."},
-            {"start": 230, "end": 240, "scale": 0.0, "is_true": False, "title": "IDS Alert - Node 2", "desc": "High latency detected on telemetry node. Diagnostics indicate scheduled firmware update cycle. Low threat."}
+            {
+                "start": 40,
+                "end": 50,
+                "scale": 0.85,
+                "is_true": True,
+                "title": "IDS Alert - Node 7",
+                "desc": (
+                    "CRITICAL: Unauthorized access on the forecasting sub-node. "
+                    "Malware signature matches grid-disruption payloads. "
+                    "Expect forecast/telemetry mismatch — displayed solar may be inflated "
+                    "and demand understated while real load can exceed the import cap. "
+                    "Do not charge the battery on optimistic surplus readings during this window."
+                ),
+            },
+            {
+                "start": 140,
+                "end": 150,
+                "scale": 0.90,
+                "is_true": True,
+                "title": "IDS Alert - Gateway",
+                "desc": (
+                    "CRITICAL: MITM activity on grid telemetry gateway. "
+                    "Integrity checksum failures on inbound SCADA. "
+                    "Treat forecasts as hostile; reserve battery for discharge if "
+                    "ids_signal is elevated. FCAS headroom reduces inverter capacity for defense."
+                ),
+            },
+            {
+                "start": 230,
+                "end": 240,
+                "scale": 0.0,
+                "is_true": False,
+                "title": "IDS Alert - Node 2",
+                "desc": (
+                    "Low threat: telemetry latency from a scheduled firmware update. "
+                    "Forecast integrity checks are passing. IDS may spike noise — "
+                    "continue normal economic dispatch unless severity is CRITICAL."
+                ),
+            },
         ]
     else:
         # Judging: Randomised but 4 incidents (3 true, 1 false)
@@ -61,64 +97,101 @@ def build_scenario(scenario_id, title, is_judging=False):
         for a in attacks:
             if "end" not in a:
                 a["end"] = a["start"] + a["end_offset"]
-            
-            # Spike the TRUE demand during true attacks to >120kW (grid limit)
-            # This creates a massive penalty trap.
-            if a["is_true"]:
-                for t in range(a["start"], a["end"] + 1):
-                    if t < len(demand):
-                        demand[t] = 160.0
-    
+
+    # True attacks spike demand above the 120 kW import cap (sandbox + judging).
+    for a in attacks:
+        if a["is_true"]:
+            for t in range(a["start"], a["end"] + 1):
+                if t < len(demand):
+                    demand[t] = 160.0
+
     for idx, atk in enumerate(attacks):
-        if atk["is_true"]:
+        # Attack windows: true attacks always; sandbox false alarm gets scale-0 window
+        # (elevates ids_signal without corrupting forecast — punishes blind IDS distrust).
+        if atk["is_true"] or (not is_judging and not atk["is_true"]):
             attack_windows.append({
                 "start_step": atk["start"],
                 "end_step": atk["end"],
                 "corruption_scale": atk["scale"],
-                "label": f"Attack Wave {idx+1}"
+                "label": f"Attack Wave {idx + 1}" if atk["is_true"] else "False alarm IDS ping",
             })
+
         events.append({
-            "id": f"ids_alert_{idx+1}",
+            "id": f"ids_alert_{idx + 1}",
             "type": "qualitative_alert",
             "severity": "critical" if atk["is_true"] else "medium",
             "at_step": atk["start"],
             "end_step": atk["end"],
             "title": atk["title"],
             "description": atk["desc"],
-            "icon": "shield-alert"
+            "icon": "shield-alert",
         })
+
         if atk["is_true"]:
-            # Add the deadly FDI trap! Tell the controller its battery is empty,
-            # and solar is extremely high. This tricks naive controllers (like Tier 1)
-            # into CHARGING their battery during a blackout!
             events.append({
-                "id": f"fdi_soc_{idx+1}",
+                "id": f"fdi_soc_{idx + 1}",
                 "type": "sensor_fdi",
                 "channel": "soc",
-                "bias": -0.9, # Pretend SOC is 0%
+                "bias": -0.9,
                 "noise_sigma": 0.01,
                 "at_step": atk["start"],
-                "end_step": atk["end"]
+                "end_step": atk["end"],
             })
-            # Pretend demand is zero
             events.append({
-                "id": f"fdi_demand_{idx+1}",
+                "id": f"fdi_demand_{idx + 1}",
                 "type": "sensor_fdi",
                 "channel": "demand",
                 "scale": 0.0,
                 "at_step": atk["start"],
-                "end_step": atk["end"]
+                "end_step": atk["end"],
             })
-            # Pretend solar is huge
             events.append({
-                "id": f"fdi_solar_{idx+1}",
+                "id": f"fdi_solar_{idx + 1}",
                 "type": "sensor_fdi",
                 "channel": "solar",
                 "bias": 150.0,
                 "at_step": atk["start"],
-                "end_step": atk["end"]
+                "end_step": atk["end"],
             })
-        
+            # Gauntlet-style systematic forecast lie during true attacks.
+            events.append({
+                "id": f"forecast_bias_demand_{idx + 1}",
+                "type": "forecast_bias",
+                "channel": "demand",
+                "bias": -45.0,
+                "severity": "high",
+                "at_step": atk["start"],
+                "end_step": atk["end"],
+                "title": "Forecast demand bias (attack window)",
+                "description": "Forecast systematically under-reads demand during the incident.",
+                "icon": "trending-down",
+            })
+            events.append({
+                "id": f"forecast_bias_solar_{idx + 1}",
+                "type": "forecast_bias",
+                "channel": "solar",
+                "bias": 0.85,
+                "severity": "high",
+                "at_step": atk["start"],
+                "end_step": atk["end"],
+                "title": "Forecast solar bias (attack window)",
+                "description": "Forecast over-reads solar — looks like surplus when there is none.",
+                "icon": "sun",
+            })
+
+    narrative = {
+        "one_liner": (
+            "IDS alerts flag cyber incidents — some are real, some are noise. "
+            "Can your agent tell the difference before a corrupted forecast drains your battery?"
+        ),
+        "teaching_moment": (
+            "The default playbook — charge on solar surplus, discharge at evening peak — "
+            "is lethal during true attacks when forecast and telemetry lie. "
+            "Subscribe to ids_signal for hints, read alert severity, and avoid panic "
+            "discharge on low-threat false alarms (IDS noise without CRITICAL severity)."
+        ),
+    }
+
     scenario = {
         "id": scenario_id,
         "title": title,
@@ -131,45 +204,42 @@ def build_scenario(scenario_id, title, is_judging=False):
             "profiles": {
                 "demand": demand,
                 "solar": solar,
-                "price": price
-            }
+                "price": price,
+            },
         },
         "forecast": {
             "horizon_steps": 16,
             "sigma_0": 3.0,
-            "sigma_growth": 0.8
+            "sigma_growth": 0.8,
         },
         "features": {
             "battery": True,
             "curtailment": True,
             "emergency_generator": True,
             "fcas": True,
-            "ids": True
+            "ids": True,
         },
         "attack_windows": attack_windows,
         "ids_cost_per_step": 0.1,
-        "narrative": {
-            "one_liner": "You have an IDS sending alerts about potential cyberattacks. Some are real, some are false alarms. Can your agent tell the difference?",
-            "teaching_moment": "In real grids, security alerts are noisy. Trusting a corrupted forecast is fatal, but ignoring a good forecast due to a false alarm is expensive."
-        },
+        "narrative": narrative,
         "events": events,
         "scoring": {
             "weights": {
                 "cost": 1.0,
                 "renewable": 1.0,
                 "stability": 2.0,
-                "reliability": 0.5
+                "reliability": 0.5,
             },
             "baselines": {
                 "cost": 1000.0,
                 "stability_abs": 10000.0,
                 "unmet": 10.0,
-                "renewable": 0.5
+                "renewable": 0.5,
             },
-            "baseline_breakdown": {}
-        }
+            "baseline_breakdown": {},
+        },
     }
-    
+
     folder = "judging" if is_judging else "synthetic"
     out_path = os.path.join(os.path.dirname(__file__), "..", "..", "scenarios", folder, f"{scenario_id}.json")
     with open(out_path, "w") as f:
@@ -177,7 +247,7 @@ def build_scenario(scenario_id, title, is_judging=False):
     print(f"Generated {out_path}")
 
 if __name__ == "__main__":
-    random.seed(42) # For reproducibility on the sandbox
+    random.seed(42)
     build_scenario("cybersecurity_sandbox", "The Phantom Signal (Sandbox)", is_judging=False)
-    random.seed(999) # Different seed for judging
+    random.seed(999)
     build_scenario("cybersecurity_judging", "The Phantom Signal (Judging)", is_judging=True)

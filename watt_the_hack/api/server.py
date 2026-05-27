@@ -27,6 +27,8 @@ from watt_the_hack.data_loaders.scenarios import (
 )
 from watt_the_hack.engine.engine import Engine, SimulationConfig
 from watt_the_hack.metrics.metrics import Metrics
+from watt_the_hack.simulation.runner import run_strategy
+from watt_the_hack.simulation.strategy import ResolvedStrategy
 
 
 class ParametricControllerParamsModel(BaseModel):
@@ -321,27 +323,40 @@ def sim_run(req: RunRequest) -> RunResponse:
     states: list[dict[str, Any]] = []
     outputs_list: list[dict[str, Any]] = []
 
-    for _ in range(req.steps):
-        controller_state = _state_visible_to_controller(state)
+    # Browser playground controllers are function-only (no plan/replan), so
+    # we wrap controller_fn in a ResolvedStrategy with a fallback shim — the
+    # sandbox already swallows participant exceptions, but the shared core
+    # also catches them via on_error if anything slips through. Using
+    # run_strategy here keeps the playground on the same simulation
+    # pipeline as the local CLI and the cloud admin container, so any
+    # engine-contract change automatically applies to all three.
+    def _safe_step(view: dict) -> dict:
+        nonlocal controller_error
         try:
-            action = controller_fn(controller_state)
-        except Exception as exc:
+            return controller_fn(view)
+        except Exception as exc:  # noqa: BLE001
             controller_error = controller_error or f"Runtime error: {exc}"
-            action = fallback(controller_state)
+            return fallback(view)
 
-        state, outputs = run_engine.step(state, action)
-        metrics.update(state, outputs)
-
-        # Save copies for the response
-        out_state = dict(state)
+    def _capture(_i: int, _view, _action, outputs: dict, post_state: dict) -> None:
+        out_state = dict(post_state)
         out_outputs = dict(outputs)
-
         if is_judging:
             _strip_judging_data(out_state, out_outputs)
-
         _prepare_state_for_response(out_state)
         states.append(out_state)
         outputs_list.append(out_outputs)
+
+    strategy = ResolvedStrategy(step=_safe_step, kind="callable", name="browser")
+    run_result = run_strategy(
+        run_engine,
+        state,
+        strategy,
+        req.steps,
+        on_step=_capture,
+        metrics=metrics,
+    )
+    state = run_result["final_state"]
 
     final_state = dict(state)
     if is_judging:

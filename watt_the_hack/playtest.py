@@ -27,85 +27,28 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
+import html
 import json
 import sys
 import time
 import traceback
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from watt_the_hack.data_loaders.scenarios import (
-    config_overrides,
-    find_scenario_by_id,
-    list_scenarios,
-    load_scenario,
+from watt_the_hack.data_loaders.scenarios import list_scenarios
+from watt_the_hack.engine.engine import Engine
+from watt_the_hack.simulation.boot import (
+    ScenarioNotFound,
+    boot_scenario,
+    scenario_steps,
 )
-from watt_the_hack.engine.engine import Engine, SimulationConfig
-from watt_the_hack.metrics.metrics import Metrics
-
-
-ZERO_ACTION: dict[str, float] = {
-    "battery_flow_kw": 0.0,
-    "emergency_generator": 0.0,
-    "curtail_solar": 0.0,
-    "fcas_reserve_kw": 0.0,
-}
-
-
-def load_controller_module(path: Path) -> Any:
-    """Import a .py file by absolute path and return the module object.
-
-    The file's parent dir is added to ``sys.path`` first so co-located
-    helper modules import normally.
-    """
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"Controller file not found: {path}")
-    parent = str(path.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not build import spec for {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _resolve_strategy(
-    module: Any,
-) -> tuple[str, Callable, Callable | None, Callable | None, Any]:
-    """Inspect a loaded module and return (kind, step_fn, plan_fn, replan_fn, instance).
-
-    Accepts the same shapes the cloud admin server accepts:
-      * class ``Strategy`` with at least a ``step(state)`` method, optionally
-        ``plan(state)`` and ``replan(state, alerts)``;
-      * top-level callable ``controller(state)``.
-    """
-    cls = getattr(module, "Strategy", None)
-    if isinstance(cls, type):
-        instance = cls()
-        step = getattr(instance, "step", None)
-        if not callable(step):
-            raise TypeError(
-                "`Strategy` class must define a `step(self, state)` method."
-            )
-        return (
-            "class",
-            step,
-            getattr(instance, "plan", None) if callable(getattr(instance, "plan", None)) else None,
-            getattr(instance, "replan", None) if callable(getattr(instance, "replan", None)) else None,
-            instance,
-        )
-    func = getattr(module, "controller", None)
-    if callable(func):
-        return ("function", func, None, None, None)
-    raise AttributeError(
-        f"Controller module {module.__name__!r} must expose either a "
-        f"`Strategy` class or a `controller(state)` function."
-    )
+from watt_the_hack.simulation.runner import run_strategy
+from watt_the_hack.simulation.strategy import (
+    ZERO_ACTION,
+    resolve_strategy_from_path,
+)
 
 
 def run_playtest(
@@ -115,6 +58,7 @@ def run_playtest(
     plots: bool = True,
     max_steps: int | None = None,
     verbose: bool = True,
+    open_report: bool = False,
 ) -> dict:
     """Run one scenario end-to-end against a controller file. Returns a
     result dict and writes artifacts to ``out_dir`` (created if missing).
@@ -122,93 +66,60 @@ def run_playtest(
     Set ``plots=False`` to skip PNG generation (no matplotlib needed).
     """
     controller_path = Path(controller_path).resolve()
-    spec_path = find_scenario_by_id(scenario_id)
-    if spec_path is None:
+
+    try:
+        engine, state, spec = boot_scenario(scenario_id)
+    except ScenarioNotFound as exc:
         raise SystemExit(
-            f"Unknown scenario_id: {scenario_id!r}. "
-            f"Run with --list-scenarios to see available options."
-        )
+            f"{exc} Run with --list-scenarios to see available options."
+        ) from exc
 
-    spec, state = load_scenario(spec_path)
-    overrides = config_overrides(spec)
-    engine = (
-        Engine(config=SimulationConfig(**overrides)) if overrides else Engine()
-    )
-    engine.add_forecast_to_state(state)
+    strategy = resolve_strategy_from_path(controller_path, name=controller_path.stem)
 
-    module = load_controller_module(controller_path)
-    kind, step_fn, plan_fn, replan_fn, _instance = _resolve_strategy(module)
-
-    metrics = Metrics(dt_hours=engine.config.dt_hours)
-    breakdown: dict[str, float] = {}
-
-    agent_plan: dict[str, Any] = {}
-    if plan_fn is not None:
-        try:
-            r = plan_fn(Engine.controller_view(state))
-            if isinstance(r, dict):
-                if "agent_plan" in r and isinstance(r["agent_plan"], dict):
-                    agent_plan.update(r["agent_plan"])
-                else:
-                    agent_plan.update(r)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [plan] raised: {exc}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-    state["agent_plan"] = agent_plan
-
-    total_steps = len(state["_profiles_full"]["demand"])
+    total_steps = scenario_steps(state)
     if max_steps is not None:
         total_steps = min(total_steps, int(max_steps))
 
     rows: list[dict[str, Any]] = []
-    controller_errors = 0
-    started = time.perf_counter()
+
+    def _on_step(i, view, action, outputs, state_after):
+        rows.append(_per_step_row(i, engine, view, action, outputs, state_after, _breakdown))
+
+    def _on_error(phase, step, exc):
+        prefix = f"[{phase}" + (f" @ step {step}]" if step >= 0 else "]")
+        print(f"  {prefix} raised: {exc}", file=sys.stderr)
+        if phase != "step":
+            traceback.print_exc(file=sys.stderr)
 
     if verbose:
         print(
             f"Scenario : {spec.get('id')} - {spec.get('title', '')}".rstrip()
         )
         print(f"Steps    : {total_steps}  (dt = {engine.config.dt_hours}h)")
-        print(f"Controller: {controller_path}  (kind={kind})")
+        print(f"Controller: {controller_path}  (kind={strategy.kind})")
 
-    for i in range(total_steps):
-        view = Engine.controller_view(state)
-        alerts = view.get("alerts") or []
-        if alerts and replan_fn is not None:
-            try:
-                u = replan_fn(view, alerts)
-                if isinstance(u, dict):
-                    if "agent_plan" in u and isinstance(u["agent_plan"], dict):
-                        agent_plan = {**agent_plan, **u["agent_plan"]}
-                    else:
-                        agent_plan = {**agent_plan, **u}
-                    state["agent_plan"] = agent_plan
-            except Exception as exc:  # noqa: BLE001
-                print(f"  [replan @ step {i}] raised: {exc}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+    # _breakdown is populated incrementally by the engine's per-step cost
+    # breakdown so each CSV row carries the running cumulative cost.
+    _breakdown: dict[str, float] = {}
+    started = time.perf_counter()
 
-        view = Engine.controller_view(state)
-        try:
-            action = step_fn(view)
-            if not isinstance(action, dict):
-                raise TypeError(
-                    f"step() must return a dict, got {type(action).__name__}"
-                )
-        except Exception as exc:  # noqa: BLE001
-            controller_errors += 1
-            print(f"  [step @ {i}] raised: {exc}", file=sys.stderr)
-            action = dict(ZERO_ACTION)
-
-        state, outputs = engine.step(state, action)
-        metrics.update(state, outputs)
+    def _accumulate_breakdown(i, view, action, outputs, state_after):
         for k, v in outputs.get("cost_breakdown", {}).items():
-            breakdown[k] = breakdown.get(k, 0.0) + float(v)
+            _breakdown[k] = _breakdown.get(k, 0.0) + float(v)
+        _on_step(i, view, action, outputs, state_after)
 
-        rows.append(_per_step_row(i, engine, view, action, outputs, state, breakdown))
-
+    result = run_strategy(
+        engine,
+        state,
+        strategy,
+        total_steps,
+        on_step=_accumulate_breakdown,
+        on_error=_on_error,
+    )
     wall = time.perf_counter() - started
-    summary = metrics.summary()
-    summary["controller_errors"] = controller_errors
+
+    summary = result["metrics"]
+    breakdown = result["cost_breakdown"]
 
     if out_dir is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -222,21 +133,33 @@ def run_playtest(
         out_dir / "meta.json",
         scenario=spec,
         controller_path=controller_path,
-        kind=kind,
+        kind=strategy.kind,
         wall_seconds=wall,
         total_steps=total_steps,
     )
     if plots:
         _maybe_write_plots(out_dir, rows, breakdown)
+    report_path = _write_report_html(
+        out_dir / "report.html",
+        summary=summary,
+        breakdown=breakdown,
+        rows=rows,
+        scenario=spec,
+        controller_path=controller_path,
+    )
 
     if verbose:
-        _print_summary(summary, breakdown, wall, out_dir)
+        _print_summary(summary, breakdown, wall, out_dir, report_path)
+
+    if open_report:
+        _open_report(report_path)
 
     return {
         "metrics": summary,
         "breakdown": breakdown,
         "rows": rows,
         "out_dir": str(out_dir),
+        "report_path": str(report_path),
         "wall_seconds": wall,
     }
 
@@ -371,8 +294,189 @@ def _maybe_write_plots(out_dir: Path, rows: list[dict], breakdown: dict) -> None
     plt.close(fig)
 
 
+def _fmt_money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _fmt_num(value: float, digits: int = 2) -> str:
+    return f"{value:,.{digits}f}"
+
+
+def _td(value: Any) -> str:
+    return f"<td>{html.escape(str(value))}</td>"
+
+
+def _diagnostic_hints(breakdown: dict) -> list[str]:
+    costs = {k: v for k, v in breakdown.items() if k != "total"}
+    top = [k for k, v in sorted(costs.items(), key=lambda kv: -abs(kv[1]))[:4] if abs(v) > 1e-9]
+    hints: list[str] = []
+    if "overvoltage_penalty" in top:
+        hints.append("Overvoltage is expensive here: inspect high-solar periods where net grid power is negative. Better controllers should charge the battery or curtail solar before exporting too much.")
+    if "tariff_import" in top or "demand_charge" in top:
+        hints.append("Import and demand charges are driving cost: look for evening or morning peaks where the battery could discharge to reduce grid import.")
+    if "ramp_charge" in top:
+        hints.append("Ramp charges are material: avoid abrupt battery or diesel changes unless they prevent a larger penalty.")
+    if "battery_wear" in top:
+        hints.append("Battery wear is material: cycling needs to be reserved for high-value periods, not every small price movement.")
+    if "blackout_penalty" in top:
+        hints.append("Blackout penalties dominate: the controller is failing the physical supply constraint before it is optimising cost.")
+    if "fcas_revenue" in top:
+        hints.append("FCAS revenue is affecting score: check whether reserve commitments are crowding out battery dispatch when the grid needs energy.")
+    return hints or ["No single diagnostic dominates. Compare the worst timesteps and action stats against the scenario intent."]
+
+
+def _write_report_html(
+    path: Path,
+    *,
+    summary: dict,
+    breakdown: dict,
+    rows: list[dict],
+    scenario: dict,
+    controller_path: Path,
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dt_hours = rows[1]["time_hours"] - rows[0]["time_hours"] if len(rows) > 1 else 0.25
+    worst_steps = sorted(rows, key=lambda r: r["step_cost"], reverse=True)[:10]
+    overvoltage_steps = [r for r in rows if abs(r["overvoltage_kw"]) > 1e-9]
+    unmet_steps = [r for r in rows if abs(r["unmet_demand_kw"]) > 1e-9]
+    imports = [max(0.0, r["net_grid_power_kw"]) for r in rows]
+    exports = [max(0.0, -r["net_grid_power_kw"]) for r in rows]
+    battery = [r["battery_flow_kw"] for r in rows]
+    diesel = [r["emergency_generator_kw"] for r in rows]
+    curtail = [r["curtail_solar_kw"] for r in rows]
+
+    cost_rows = "\n".join(
+        "<tr>"
+        + _td(k)
+        + _td(_fmt_money(v))
+        + _td(f"{(v / summary['final_score'] * 100):.1f}%" if summary["final_score"] else "n/a")
+        + "</tr>"
+        for k, v in sorted(breakdown.items(), key=lambda kv: -abs(kv[1]))
+        if k != "total"
+    )
+    worst_rows = "\n".join(
+        "<tr>"
+        + _td(r["step"])
+        + _td(_fmt_num(r["time_hours"], 2))
+        + _td(_fmt_money(r["step_cost"]))
+        + _td(_fmt_money(r["cum_cost"]))
+        + _td(_fmt_num(r["demand"], 1))
+        + _td(_fmt_num(r["solar"], 1))
+        + _td(_fmt_num(r["net_grid_power_kw"], 1))
+        + _td(_fmt_num(r["soc"], 2))
+        + _td(_fmt_num(r["battery_flow_kw"], 1))
+        + _td(_fmt_num(r["overvoltage_kw"], 1))
+        + _td(_fmt_num(r["unmet_demand_kw"], 1))
+        + "</tr>"
+        for r in worst_steps
+    )
+    hint_items = "\n".join(f"<li>{html.escape(h)}</li>" for h in _diagnostic_hints(breakdown))
+    plot_cards = []
+    for filename, title in [
+        ("action.png", "Dispatch Overview"),
+        ("cost.png", "Cumulative Cost"),
+        ("soc.png", "Battery SOC"),
+    ]:
+        if (path.parent / filename).exists():
+            plot_cards.append(
+                f'<section class="card"><h2>{title}</h2><img src="{filename}" alt="{title}"></section>'
+            )
+    if not plot_cards:
+        plot_cards.append(
+            '<section class="card"><h2>Plots</h2><p>No PNG plots were generated. Install matplotlib or run without <code>--no-plots</code>.</p></section>'
+        )
+
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Watt The Hack Playtest Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #172033; background: #f6f7fb; }}
+    h1, h2 {{ margin: 0 0 12px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+    .card {{ background: white; border: 1px solid #dde2ee; border-radius: 10px; padding: 16px; margin: 0 0 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
+    .metric {{ font-size: 28px; font-weight: 700; }}
+    .label {{ color: #5b6475; font-size: 13px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ border-bottom: 1px solid #e6e9f2; padding: 7px 8px; text-align: right; }}
+    th:first-child, td:first-child {{ text-align: left; }}
+    img {{ max-width: 100%; border: 1px solid #e6e9f2; border-radius: 8px; background: white; }}
+    code {{ background: #eef1f7; padding: 2px 4px; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  <h1>Watt The Hack Playtest Report</h1>
+  <p>{html.escape(str(scenario.get("id")))} - {html.escape(str(scenario.get("title", "")))}<br>
+  Controller: <code>{html.escape(str(controller_path))}</code></p>
+
+  <section class="grid">
+    <div class="card"><div class="label">Final Score</div><div class="metric">{_fmt_money(summary["final_score"])}</div><div class="label">lower wins</div></div>
+    <div class="card"><div class="label">Renewable Ratio</div><div class="metric">{summary["renewable_ratio"]:.3f}</div></div>
+    <div class="card"><div class="label">Unmet Demand</div><div class="metric">{summary["unmet_demand_total"]:.2f} kWh</div></div>
+    <div class="card"><div class="label">Steps</div><div class="metric">{len(rows)}</div><div class="label">{dt_hours:.2f} h timestep</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Diagnostic Hints</h2>
+    <ul>{hint_items}</ul>
+  </section>
+
+  {"".join(plot_cards)}
+
+  <section class="grid">
+    <div class="card"><h2>Grid Violations</h2>
+      <table>
+        <tr><th>Signal</th><th>Steps</th><th>Max kW</th></tr>
+        <tr>{_td("overvoltage")}{_td(len(overvoltage_steps))}{_td(_fmt_num(max([r["overvoltage_kw"] for r in rows], default=0.0), 1))}</tr>
+        <tr>{_td("unmet demand")}{_td(len(unmet_steps))}{_td(_fmt_num(max([r["unmet_demand_kw"] for r in rows], default=0.0), 1))}</tr>
+      </table>
+    </div>
+    <div class="card"><h2>Action Stats</h2>
+      <table>
+        <tr><th>Signal</th><th>Min</th><th>Max</th><th>Total</th></tr>
+        <tr>{_td("battery kW")}{_td(_fmt_num(min(battery, default=0.0), 1))}{_td(_fmt_num(max(battery, default=0.0), 1))}{_td(_fmt_num(sum(abs(v) for v in battery) * dt_hours, 1) + " kWh throughput")}</tr>
+        <tr>{_td("diesel kW")}{_td(_fmt_num(min(diesel, default=0.0), 1))}{_td(_fmt_num(max(diesel, default=0.0), 1))}{_td(_fmt_num(sum(diesel) * dt_hours, 1) + " kWh")}</tr>
+        <tr>{_td("curtail kW")}{_td(_fmt_num(min(curtail, default=0.0), 1))}{_td(_fmt_num(max(curtail, default=0.0), 1))}{_td(_fmt_num(sum(curtail) * dt_hours, 1) + " kWh")}</tr>
+        <tr>{_td("grid import/export")}{_td(_fmt_num(max(exports, default=0.0), 1) + " export")}{_td(_fmt_num(max(imports, default=0.0), 1) + " import")}{_td(_fmt_num(sum(imports) * dt_hours, 1) + " kWh import")}</tr>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Cost Breakdown</h2>
+    <table><tr><th>Component</th><th>Cost</th><th>Share</th></tr>{cost_rows}</table>
+  </section>
+
+  <section class="card">
+    <h2>Worst Timesteps</h2>
+    <table>
+      <tr><th>Step</th><th>Hour</th><th>Step Cost</th><th>Cumulative</th><th>Demand</th><th>Solar</th><th>Net Grid</th><th>SOC</th><th>Battery</th><th>Overvoltage</th><th>Unmet</th></tr>
+      {worst_rows}
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Artifacts</h2>
+    <p><a href="steps.csv">steps.csv</a> | <a href="metrics.json">metrics.json</a> | <a href="meta.json">meta.json</a></p>
+  </section>
+</body>
+</html>
+"""
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _open_report(path: Path) -> None:
+    try:
+        webbrowser.open(path.resolve().as_uri())
+        print(f"opened report: {path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [report] could not open browser: {exc}", file=sys.stderr)
+
+
 def _print_summary(
-    summary: dict, breakdown: dict, wall_seconds: float, out_dir: Path
+    summary: dict, breakdown: dict, wall_seconds: float, out_dir: Path, report_path: Path
 ) -> None:
     print()
     print(f"final_score          ${summary['final_score']:>12.2f}   (lower wins)")
@@ -390,6 +494,7 @@ def _print_summary(
             print(f"  {k:<28s} ${v:>10.2f}")
     print()
     print(f"artifacts: {out_dir}")
+    print(f"report:    {report_path}")
 
 
 def _disambiguate_names(paths: list[Path]) -> list[str]:
@@ -652,6 +757,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress per-run console summary; just write artifacts.",
     )
+    p.add_argument(
+        "--open-report",
+        action="store_true",
+        help="Open the generated report.html in your default browser after the run.",
+    )
     return p
 
 
@@ -684,8 +794,14 @@ def main(argv: list[str] | None = None) -> int:
             plots=not args.no_plots,
             max_steps=args.steps,
             verbose=not args.quiet,
+            open_report=args.open_report,
         )
     else:
+        if args.open_report:
+            print(
+                "  [report] --open-report is currently only supported for single-controller runs.",
+                file=sys.stderr,
+            )
         run_sweep(
             controller_paths=args.controller,
             scenario_id=args.scenario,
