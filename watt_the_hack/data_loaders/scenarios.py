@@ -126,6 +126,7 @@ def public_metadata(spec: dict) -> dict:
         },
         "scoring": scoring_config(spec),
         "mechanics": scenario_mechanics(spec),
+        "controller_modes": spec.get("controller_modes"),
         "duration_steps": _scenario_duration_steps(spec),
         "start_hour": float(spec.get("start_hour", 0.0)),
         "dt_hours": cfg.dt_hours,

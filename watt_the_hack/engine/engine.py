@@ -111,8 +111,8 @@ class SimulationConfig:
     # controller can prefer compliance breach to load shedding in a
     # genuine emergency. This is the design: compliance is a soft
     # operational constraint, not a hard physics one.
-    compliance_soc_penalty_per_unit: float = 50.00  # $/SOC-unit short, per step
-    compliance_export_penalty_per_kw: float = 25.00  # $/kW exceeded, per step
+    compliance_soc_penalty_per_unit: float = 200.00  # $/SOC-unit short, per step
+    compliance_export_penalty_per_kw: float = 50.00  # $/kW exceeded, per step
 
     # ---------------- Diesel ban + exemption mechanic ----------------
     # Scenarios may declare ``diesel_ban_window`` events (with a
@@ -599,6 +599,7 @@ class Engine(SimulationEngine):
         Multiple active windows accumulate.
         """
         soc_shortfall = 0.0
+        soc_excess = 0.0
         export_excess = 0.0
         export_kw = max(0.0, -net_grid_power_kw)
 
@@ -611,15 +612,20 @@ class Engine(SimulationEngine):
                 continue
 
             floor = ev.get("min_soc_floor")
+            multiplier = float(ev.get("penalty_multiplier", 1.0))
             if isinstance(floor, (int, float)):
-                soc_shortfall += max(0.0, float(floor) - soc_after)
+                soc_shortfall += max(0.0, float(floor) - soc_after) * multiplier
+
+            ceiling = ev.get("max_soc_ceiling")
+            if isinstance(ceiling, (int, float)):
+                soc_excess += max(0.0, soc_after - float(ceiling)) * multiplier
 
             cap = ev.get("max_export_kw_override")
             if isinstance(cap, (int, float)) and export_kw > 0:
-                export_excess += max(0.0, export_kw - float(cap))
+                export_excess += max(0.0, export_kw - float(cap)) * multiplier
 
         return {
-            "soc_shortfall": soc_shortfall,
+            "soc_shortfall": soc_shortfall + soc_excess,
             "export_excess_kw": export_excess,
         }
 

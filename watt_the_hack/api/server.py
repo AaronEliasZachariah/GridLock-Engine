@@ -133,7 +133,7 @@ _submission_counts: dict[str, int] = defaultdict(int)
 # For the actual hackathon where you incrementally release scenarios, set AUTO_UNLOCK=false.
 _auto_unlock = os.getenv("AUTO_UNLOCK", "true").lower() == "true"
 
-_unlocked_scenarios: set[str] = {"t1_welcome"}
+_unlocked_scenarios: set[str] = {"t1_welcome", "t2_first_code"}
 if _auto_unlock:
     _unlocked_scenarios.update(s["id"] for s in list_scenarios(include_judging=False))
 
