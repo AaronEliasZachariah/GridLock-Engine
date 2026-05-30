@@ -35,8 +35,9 @@ class SimulationConfig:
     dt_hours: float = 0.25
 
     # FCAS Dispatch Penalties and Bonuses
-    fcas_shortfall_penalty_per_kwh: float = 20.0
-    fcas_dispatch_bonus_per_kwh: float = 0.20
+    fcas_shortfall_penalty_per_kwh: float = 20000.0
+    fcas_dispatch_bonus_per_kwh: float = 200.0
+    fcas_micro_cycling_factor: float = 0.01  # kWh of throughput per kW of reserve per hour
 
 
     # Phase 3 Realism: Split Pricing & Penalties
@@ -723,11 +724,18 @@ class Engine(SimulationEngine):
         # Throughput budget: decrement by |kWh| moved through the battery
         # this step. Only tracked when the scenario opted in (initial value
         # is not None).
+        dt = self.config.dt_hours
+        total_throughput_this_step = (
+            abs(physics.battery_kw) +
+            (physics.fcas_reserve_kw * self.config.fcas_micro_cycling_factor) +
+            physics.fcas_dispatch_delivered_kw
+        ) * dt
+
         budget = state.get("battery_throughput_remaining_kwh")
         if budget is not None:
             new_state["battery_throughput_remaining_kwh"] = max(
                 0.0,
-                float(budget) - abs(physics.battery_kw) * self.config.dt_hours,
+                float(budget) - total_throughput_this_step,
             )
 
         # Mirror profiles → top-level scalars for controllers to read.
@@ -1142,8 +1150,14 @@ class Engine(SimulationEngine):
         # through the battery across the run. When set, the remaining
         # budget further clips this step's dispatch magnitude.
         if battery_throughput_remaining_kwh is not None:
+            # We subtract the FCAS micro-cycling portion of the budget
+            # because even if the battery doesn't dispatch for arbitrage,
+            # holding reserve cycles the inverter/cells.
+            fcas_cycling_cost = (
+                fcas_reserve_kw * cfg.fcas_micro_cycling_factor * cfg.dt_hours
+            )
             budget_kw_cap = max(
-                0.0, float(battery_throughput_remaining_kwh) / cfg.dt_hours
+                0.0, (float(battery_throughput_remaining_kwh) - fcas_cycling_cost) / cfg.dt_hours
             )
             battery_inverter_budget = min(battery_inverter_budget, budget_kw_cap)
 
