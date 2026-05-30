@@ -27,3 +27,6 @@ test = [
 
 [tool.setuptools.packages.find]
 include = ["watt_the_hack*"]
+
+[tool.setuptools.package-data]
+watt_the_hack = ["scenarios/*/*.json"]

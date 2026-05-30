@@ -10,33 +10,43 @@ This is the public engine package — controllers, scenarios authoring, and the 
 pip install git+https://github.com/AaronEliasZachariah/Watt-The-Hack-Engine-Public.git
 ```
 
+Scenarios are released incrementally through package updates. Whenever the
+organisers announce a new public scenario, update the engine before playtesting:
+
+```bash
+pip install --upgrade --force-reinstall git+https://github.com/AaronEliasZachariah/Watt-The-Hack-Engine-Public.git
+```
+
+This public release includes one starter scenario:
+
+```bash
+python -m watt_the_hack.playtest --list-scenarios
+```
+
+Expected first scenario:
+
+```text
+t1_welcome  tutorial  Tutorial 1: The Basics
+```
+
 ## Quick start
 
+Create `strategy.py`:
+
 ```python
-from watt_the_hack.engine.engine import Engine
-from watt_the_hack.simulation.runner import run_simulation
-
-engine = Engine()
-state = {
-    "time": 0,
-    "demand": 50.0,
-    "solar": 0.0,
-    "soc": 0.5,
-    "price": 0.20,
-    "profiles": {"demand": [50.0] * 96, "solar": [0.0] * 96},
-    "price_profile": [0.20] * 96,
-}
-
 def controller(state):
     return {
-        "battery_flow_kw": 0.0,
+        "battery_flow_mw": 0.0,
         "emergency_generator": 0.0,
         "curtail_solar": 0.0,
-        "fcas_reserve_kw": 0.0,
+        "fcas_reserve_mw": 0.0,
     }
+```
 
-result = run_simulation(engine=engine, controller=controller, initial_state=state, steps=96)
-print(result["metrics"])
+Then run the local playtest harness:
+
+```bash
+python -m watt_the_hack.playtest strategy.py --scenario t1_welcome --open-report
 ```
 
 ## What's in here
