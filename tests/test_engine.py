@@ -301,6 +301,7 @@ class TestMarketStep:
             "ids_cost",
             "diesel_ban_penalty",
             "phishing_fine",
+            "cyber_containment_fine",
             "total",
         }
         # total must equal the sum of the other components

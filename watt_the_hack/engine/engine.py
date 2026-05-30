@@ -35,15 +35,15 @@ class SimulationConfig:
     dt_hours: float = 0.25
 
     # FCAS Dispatch Penalties and Bonuses
-    fcas_shortfall_penalty_per_mwh: float = 20000.0
+    fcas_shortfall_penalty_per_mwh: float = 100000.0
     fcas_dispatch_bonus_per_mwh: float = 200.0
     fcas_micro_cycling_factor: float = 0.01  # MWh of throughput per MW of reserve per hour
     fcas_ramp_penalty_per_mw: float = 500.0
 
-
-    # Phase 3 Realism: Split Pricing & Penalties
-    export_tariff: float = 50.0  # $50.00 flat rate for exporting solar (was 0.05)
-    blackout_penalty_per_mwh: float = 10000.00
+    # Grid shortfall (unmet demand) penalty
+    # $10k/MWh is standard Value of Lost Load (VoLL) in many markets.
+    blackout_penalty_per_mwh: float = 100000.00
+    export_tariff: float = 50.0
     emergency_generator_cost_per_mwh: float = 1000.00
     max_emergency_generator_mw: float = 50.0
     overvoltage_penalty_per_mwh: float = 5000.00  # NEW: Penalty for exporting too much
@@ -147,6 +147,9 @@ class SimulationConfig:
     min_exemption_reason_chars: int = 60
     max_exemption_duration_steps: int = 12
 
+    # ---------------- Cybersecurity mechanic (S5+) ----------------
+    cyber_containment_penalty: float = 50000.00  # Penalty for missing real attack or ACKing fake attack
+
     # Forecast configuration (lookahead with growing noise)
     forecast_horizon: int = 16  # how many future steps the controller sees
     forecast_sigma_demand: float = 3.0  # additive noise std (MW)
@@ -204,7 +207,8 @@ _CONTROLLER_PUBLIC_KEYS: frozenset[str] = frozenset(
         # Currently-firing qualitative alerts (redacted; no bias/sigma payload)
         "alerts",
         # Numerical probability signal indicating attack likelihood if subscribed
-        "ids_signal",
+        "ids_signal_node_a",
+        "ids_signal_node_b",
     }
 )
 
@@ -433,6 +437,13 @@ class Engine(SimulationEngine):
             state.setdefault("_phishing_traps_charged", set()),
         )
         
+        # Cyber containment penalty
+        cyber_containment_fine = self._cyber_containment_fine(
+            events_full,
+            time,
+            action.get("agent_plan")
+        )
+        
         # Calculate FCAS Dispatch Logic (mutate physics next_soc)
         required_mw = 0.0
         for ev in events_full:
@@ -484,8 +495,42 @@ class Engine(SimulationEngine):
             ids_cost_per_step=ids_cost_per_step,
             diesel_ban_penalty_mwh=diesel_ban_penalty_mwh,
             phishing_fine=phishing_fine,
+            cyber_containment_fine=cyber_containment_fine,
             prev_fcas_reserve_mw=float(state.get("prev_fcas_reserve_mw", 0.0)),
         )
+
+    def _cyber_containment_fine(
+        self,
+        events: list[dict],
+        time: int,
+        agent_plan: dict | None,
+    ) -> float:
+        fine = 0.0
+        if not isinstance(agent_plan, dict):
+            agent_plan = {}
+            
+        ack_id = agent_plan.get("containment_ack")
+        
+        for ev in events:
+            if ev.get("type") != "cyber_attack_window":
+                continue
+            
+            at_step = int(ev.get("at_step", -1))
+            end_step = int(ev.get("end_step", at_step))
+            
+            if not (at_step <= time <= end_step):
+                continue
+                
+            attack_id = ev.get("attack_id", f"attack_{at_step}")
+            is_real = ev.get("is_real", True)
+            
+            if is_real and ack_id != attack_id:
+                fine += self.config.cyber_containment_penalty
+                
+            if not is_real and ack_id == attack_id:
+                fine += self.config.cyber_containment_penalty
+                
+        return fine
 
     def _diesel_ban_penalty_mwh(
         self,
@@ -776,17 +821,31 @@ class Engine(SimulationEngine):
         # IDS signal — noisy attack probability hint if controller subscribed
         attack_windows = self._full_attack_windows(state)
         in_attack = any(
-            w["start_step"] <= next_time <= w["end_step"] for w in attack_windows
+            w["start_step"] <= next_time <= w["end_step"] and w.get("is_real", True) for w in attack_windows
         )
+        in_fake_attack = any(
+            w["start_step"] <= next_time <= w["end_step"] and not w.get("is_real", True) for w in attack_windows
+        )
+        
         if action.get("subscribe_ids", False):
-            ids_rng = random.Random(f"{next_time}_ids_{state.get('scenario_id', '')}")
+            ids_rng_a = random.Random(f"{next_time}_ids_a_{state.get('scenario_id', '')}")
+            ids_rng_b = random.Random(f"{next_time}_ids_b_{state.get('scenario_id', '')}")
+            
             if in_attack:
-                raw = ids_rng.gauss(0.75, 0.15)
+                raw_a = ids_rng_a.gauss(0.85, 0.20)
+                raw_b = ids_rng_b.gauss(0.65, 0.10)
+            elif in_fake_attack:
+                raw_a = ids_rng_a.gauss(0.60, 0.20)
+                raw_b = ids_rng_b.gauss(0.10, 0.05)
             else:
-                raw = ids_rng.gauss(0.15, 0.10)
-            new_state["ids_signal"] = max(0.0, min(1.0, raw))
+                raw_a = ids_rng_a.gauss(0.20, 0.15)
+                raw_b = ids_rng_b.gauss(0.10, 0.05)
+
+            new_state["ids_signal_node_a"] = max(0.0, min(1.0, raw_a))
+            new_state["ids_signal_node_b"] = max(0.0, min(1.0, raw_b))
         else:
-            new_state["ids_signal"] = None
+            new_state["ids_signal_node_a"] = None
+            new_state["ids_signal_node_b"] = None
             
         new_state["fcas_events_upcoming"] = self._future_fcas_events(state, next_time)
 
@@ -1238,6 +1297,7 @@ class Engine(SimulationEngine):
         ids_cost_per_step: float = 0.0,
         diesel_ban_penalty_mwh: float = 0.0,
         phishing_fine: float = 0.0,
+        cyber_containment_fine: float = 0.0,
     ) -> dict:
         """Calculate every cost component for this timestep.
 
@@ -1324,6 +1384,7 @@ class Engine(SimulationEngine):
             "fcas_dispatch_bonus": -fcas_dispatch_delivered_mw * dt * cfg.fcas_dispatch_bonus_per_mwh,
             "fcas_shortfall_penalty": fcas_shortfall_mw * dt * cfg.fcas_shortfall_penalty_per_mwh,
             "phishing_fine": phishing_fine,
+            "cyber_containment_fine": cyber_containment_fine,
         }
 
         return {

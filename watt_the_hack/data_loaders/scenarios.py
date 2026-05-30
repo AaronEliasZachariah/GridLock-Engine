@@ -19,18 +19,10 @@ from typing import Any
 
 from watt_the_hack.engine.engine import SimulationConfig
 
-def _default_scenarios_root() -> Path:
-    package_root = Path(__file__).resolve().parents[1]
-    packaged_root = package_root / "scenarios"
-    if packaged_root.exists():
-        return packaged_root
-    return package_root.parent / "scenarios"
-
-
 SCENARIOS_ROOT = (
     Path(os.environ["SCENARIOS_DATA_DIR"])
     if "SCENARIOS_DATA_DIR" in os.environ
-    else _default_scenarios_root()
+    else Path(__file__).resolve().parents[2] / "scenarios"
 )
 
 UNIT_SCALE = 1000.0
