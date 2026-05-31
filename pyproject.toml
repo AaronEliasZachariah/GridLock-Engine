@@ -27,3 +27,8 @@ test = [
 
 [tool.setuptools.packages.find]
 include = ["watt_the_hack*"]
+
+[tool.pytest.ini_options]
+# Only collect the real test suite. Keeps bare `pytest` from scanning stray
+# scratch dirs (e.g. codex-pytest-tmp) that can trip collection on Windows.
+testpaths = ["tests"]
